@@ -27,12 +27,14 @@ removido por ficar redundante com `K0K1ManifestCV`.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+import yaml
 
 from folders_frist import GroupTable, assign_groups_to_folds
 
@@ -376,9 +378,88 @@ class ManifestGroupDataset(Dataset):
 
 
 # --------------------------------------------------------------------------- #
-# 5. Demonstração / comparação com o fluxo atual
+# 5. CLI orientada a YAML
 # --------------------------------------------------------------------------- #
-if __name__ == "__main__":
+def load_manifest_cv_config(path: str | Path) -> dict:
+    """Lê um config_manifest_cv.yaml (chaves no nível raiz do arquivo)."""
+    with open(path, "r") as f:
+        cfg = yaml.safe_load(f)
+    return {
+        "src_root": cfg["src_root"],
+        "out_root": cfg.get("out_root", "data"),
+        "k0": cfg.get("k0", 10),
+        "k1": cfg.get("k1", 5),
+        "alpha": cfg.get("alpha", 1.0),
+        "beta": cfg.get("beta", 1.0),
+        "seed": cfg.get("seed", 42),
+        "n_refine": cfg.get("n_refine", 20_000),
+    }
+
+
+def run_from_config(config_path: str | Path) -> Path:
+    """
+    Lê `src_root` (layout data_dir/<classe>/<sonograma_id>/<recorte>.png),
+    calcula a divisão aninhada K0 x K1 e grava em `out_root`:
+
+      manifest_k0k1.json           -> Arquivo 1 (sonogramas x rodadas de K0)
+      manifest_k0k1_auditoria.json -> Arquivo 2 (pasta -> sonogramas, auditoria)
+      fold_counts.csv              -> contagens/percentuais por classe
+
+    Retorna `out_root`.
+    """
+    cfg = load_manifest_cv_config(config_path)
+
+    cv = K0K1ManifestCV(
+        k0=cfg["k0"],
+        k1=cfg["k1"],
+        alpha=cfg["alpha"],
+        beta=cfg["beta"],
+        seed=cfg["seed"],
+        n_refine=cfg["n_refine"],
+    )
+    manifest = cv.fit_from_folders(cfg["src_root"])
+
+    sonogramas = manifest["sonogramas"]
+    n_grupos = len(sonogramas)
+    n_imagens = sum(info["n_imagens"] for info in sonogramas.values())
+    print(f"Lendo {cfg['src_root']}")
+    print(f"Total: {n_imagens} imagens / {n_grupos} sonogramas")
+    print(f"K0={cfg['k0']} pastas fixas | K1={cfg['k1']} pastas recalculadas a cada rodada\n")
+
+    out_root = Path(cfg["out_root"])
+
+    manifest_path = write_manifest(manifest, out_root / "manifest_k0k1.json")
+    print(f"[ok] Arquivo 1 (sonogramas x rodadas de K0) gravado em: {manifest_path}")
+
+    indice = derive_audit_index(manifest)
+    indice_path = write_manifest(indice, out_root / "manifest_k0k1_auditoria.json")
+    print(f"[ok] Arquivo 2 (auditoria, pasta -> sonogramas) gravado em: {indice_path}")
+
+    counts_path = write_k0k1_counts(manifest, out_root)
+    print(f"[ok] Contagens por classe/fold/fold_cv (com %) registradas em: {counts_path}")
+
+    return out_root
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        help="YAML com as configurações da divisão K0 x K1 (ex.: config_manifest_cv.yaml). "
+             "Se omitido, roda a demonstração com a pasta ./data ao lado do script.",
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        run_from_config(args.config)
+    else:
+        _run_demo()
+
+
+# --------------------------------------------------------------------------- #
+# 6. Demonstração (sem YAML)
+# --------------------------------------------------------------------------- #
+def _run_demo() -> None:
     data_dir = Path("data/all_sonogram_folder")
     if not data_dir.is_dir():
         data_dir = Path("data")
@@ -413,3 +494,7 @@ if __name__ == "__main__":
 
     counts_path = write_k0k1_counts(manifest, data_dir.parent)
     print(f"[ok] Contagens por classe/fold/fold_cv (com %) registradas em: {counts_path}")
+
+
+if __name__ == "__main__":
+    main()

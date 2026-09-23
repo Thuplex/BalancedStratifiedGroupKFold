@@ -1,0 +1,9 @@
+src_root: 'data/all_sonogram_folder'   # data/all reorganizado em <classe>/<sonograma_id>/<recorte>.png
+out_root: 'data'                       # onde gravar manifest_k0k1.json, manifest_k0k1_auditoria.json e fold_counts.csv
+
+k0: 10                # nº de pastas externas (uma rodada por pasta, cada uma vira teste fixo uma vez)
+k1: 5                 # nº de pastas internas de validação cruzada, recalculadas do zero a cada rodada de k0
+alpha: 1.0            # peso da estratificação por classe
+beta: 1.0             # peso do balanceamento de tamanho dos folds
+seed: 42
+n_refine: 20000
