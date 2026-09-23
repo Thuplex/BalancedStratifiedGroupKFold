@@ -1,0 +1,17 @@
+# scripts/cv_sonogram.py --config configs/cv_split_unbalanced.yaml
+#
+# Split por GRUPO (sonograma_id), não por imagem: várias imagens vêm do
+# mesmo sonograma (mesmo indivíduo/gravação) e split por imagem vaza grupo
+# entre train/test
+#Consumido por src/models/cross_validate.py via cv.cv_sonogram_folds.enabled: true — ver README, "Validação cruzada sobre as pastas do cv_sonogram.py".
+cv_split:
+  src_root: 'data/all_sonogram_folder'   # data/all reorganizado em <classe>/<sonograma_id>/<recorte>.png
+  out_root: 'data/split_80_10_10_unbalanced_sonogram'
+  k: 10
+  test_fold: 0
+  alpha: 1.0            # peso da estratificação por classe
+  beta: 1.0              # peso do balanceamento de tamanho dos folds
+  seed: 42
+  n_refine: 20000
+  link: false             # symlink em vez de copiar
+  flatten_output: true    # <classe>/<recorte>.png, compatível com src/utils/io.py

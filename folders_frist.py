@@ -20,6 +20,8 @@ Autor: gerado para pipeline de bioacústica.
 
 from __future__ import annotations
 
+import argparse
+import csv
 import json
 import shutil
 from dataclasses import dataclass
@@ -28,6 +30,7 @@ from typing import Iterator, Sequence
 
 import numpy as np
 import pandas as pd
+import yaml
 
 
 # --------------------------------------------------------------------------- #
@@ -439,6 +442,7 @@ def materialize_folds(
     label_col: str = "classe",
     fold_col: str = "fold",
     link: bool = True,
+    flatten: bool = False,
 ) -> Path:
     """
     Materializa a PARTIÇÃO EM FOLDS (a divisão em si, antes de qualquer
@@ -456,6 +460,12 @@ def materialize_folds(
     Reexecuções são seguras/idempotentes (entradas já existentes são
     puladas).
 
+    `flatten=True` remove o nível `<sonograma_id>` do caminho de destino
+    (fica `.../<classe>/<recorte>.png`), para compatibilidade com
+    consumidores que esperam os arquivos direto na pasta da classe (ex.:
+    `src/utils/io.py: gather_paths` deste projeto). Só é seguro quando os
+    nomes de arquivo já são únicos dentro da classe.
+
     Também grava `out_dirname/manifest.json`, informando em qual pasta cada
     sonograma foi colocado (ver `write_fold_manifest`).
 
@@ -469,13 +479,8 @@ def materialize_folds(
     for row in df.itertuples(index=False):
         src = Path(getattr(row, file_col))
         fold = getattr(row, fold_col)
-        dst = (
-            out_root
-            / f"fold_{int(fold):0{width}d}"
-            / getattr(row, label_col)
-            / getattr(row, group_col)
-            / src.name
-        )
+        base = out_root / f"fold_{int(fold):0{width}d}" / getattr(row, label_col)
+        dst = base / src.name if flatten else base / getattr(row, group_col) / src.name
         _link_or_copy(src, dst, link)
 
     write_fold_manifest(df, out_root, group_col, label_col, fold_col)
@@ -493,6 +498,7 @@ def materialize_split(
     group_col: str = "sonograma_id",
     label_col: str = "classe",
     link: bool = True,
+    flatten: bool = False,
 ) -> Path:
     """
     Materializa UM split 80/10/10 (train/val/test) dentro de
@@ -510,6 +516,9 @@ def materialize_split(
 
     Por padrão cria links simbólicos (link=True); use link=False para
     copiar de fato. Reexecuções são seguras/idempotentes.
+
+    `flatten=True` remove o nível `<sonograma_id>` do caminho de destino
+    (fica `.../<classe>/<recorte>.png`) — ver nota em `materialize_folds`.
     """
     data_dir = Path(data_dir)
     out_root = data_dir / out_dirname
@@ -517,22 +526,127 @@ def materialize_split(
     for nome, parte in (("train", tr), ("val", va), ("test", te)):
         for row in parte.itertuples(index=False):
             src = Path(getattr(row, file_col))
-            dst = (
-                out_root
-                / nome
-                / getattr(row, label_col)
-                / getattr(row, group_col)
-                / src.name
-            )
+            base = out_root / nome / getattr(row, label_col)
+            dst = base / src.name if flatten else base / getattr(row, group_col) / src.name
             _link_or_copy(src, dst, link)
 
     return out_root
 
 
 # --------------------------------------------------------------------------- #
-# 8. Demonstração
+# 8. Registro de contagens por classe/fold (auditoria)
 # --------------------------------------------------------------------------- #
-if __name__ == "__main__":
+def write_fold_counts(
+    df: pd.DataFrame,
+    out_root: str | Path,
+    label_col: str = "classe",
+    group_col: str = "sonograma_id",
+    fold_col: str = "fold",
+    filename: str = "fold_counts.csv",
+) -> Path:
+    """Grava `out_root/filename`: nº de imagens e de sonogramas por classe e por fold."""
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+    dest = out_root / filename
+    with open(dest, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["fold", "classe", "n_imagens", "n_sonogramas"])
+        for (fold, cls), grupo in df.groupby([fold_col, label_col]):
+            writer.writerow([int(fold), cls, len(grupo), grupo[group_col].nunique()])
+    return dest
+
+
+# --------------------------------------------------------------------------- #
+# 9. CLI orientada a YAML (integração com resize_images.py/make_splits.py)
+# --------------------------------------------------------------------------- #
+def load_cv_split_config(path: str | Path) -> dict:
+    """Lê a seção `cv_split` de um preprocession_configs*.yaml / cv_split_*.yaml."""
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+    cv = data["cv_split"]
+    return {
+        "src_root": cv["src_root"],
+        "out_root": cv["out_root"],
+        "k": cv.get("k", 10),
+        "test_fold": cv.get("test_fold", 0),
+        "alpha": cv.get("alpha", 1.0),
+        "beta": cv.get("beta", 1.0),
+        "seed": cv.get("seed", 42),
+        "n_refine": cv.get("n_refine", 20_000),
+        "link": cv.get("link", True),
+        "flatten_output": cv.get("flatten_output", True),
+    }
+
+
+def run_from_config(config_path: str | Path) -> Path:
+    """
+    Lê `src_root` (layout data_dir/<classe>/<sonograma_id>/<recorte>.png),
+    calcula os `k` folds group-aware e materializa em disco:
+
+      out_root/fold_0 .. fold_<k-1>   -> partição bruta, uma pasta por fold
+      out_root/manifest.json          -> em qual fold cada sonograma caiu
+      out_root/fold_counts.csv        -> imagens/sonogramas por classe e fold
+
+    Consumo desses folds pela validação cruzada (rotacionando os k-1 folds
+    de treino/validação em torno do `test_fold` fixo) ainda é um passo
+    futuro — ver README, seção "Split por grupo".
+
+    Retorna `out_root`.
+    """
+    cfg = load_cv_split_config(config_path)
+
+    df = build_dataframe_from_folders(cfg["src_root"])
+    print(f"Lendo {cfg['src_root']}")
+    print(f"Total: {len(df)} imagens / {df.sonograma_id.nunique()} sonogramas/gravações\n")
+
+    splitter = BalancedStratifiedGroupKFold(
+        k=cfg["k"],
+        alpha=cfg["alpha"],
+        beta=cfg["beta"],
+        seed=cfg["seed"],
+        n_refine=cfg["n_refine"],
+        test_fold=cfg["test_fold"],
+    )
+    df = splitter.fit(df)
+
+    check_no_leakage(df)
+    print_fold_summary(df)
+
+    out_root = Path(cfg["out_root"])
+    data_dir, out_dirname = out_root.parent, out_root.name
+
+    folds_dir = materialize_folds(
+        df, data_dir, out_dirname=out_dirname,
+        link=cfg["link"], flatten=cfg["flatten_output"],
+    )
+    width = len(str(cfg["k"] - 1))
+    print(f"\n[ok] {cfg['k']} pastas (fold_{0:0{width}d}..fold_{cfg['k']-1:0{width}d}) materializadas em: {folds_dir}")
+
+    counts_path = write_fold_counts(df, out_root)
+    print(f"[ok] Contagens por classe/fold registradas em: {counts_path}")
+
+    return out_root
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        help="YAML com a seção `cv_split` (ex.: configs/cv_split_unbalanced.yaml). "
+             "Se omitido, roda a demonstração com dados simulados ou a pasta ./data ao lado do script.",
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        run_from_config(args.config)
+    else:
+        _run_demo()
+
+
+# --------------------------------------------------------------------------- #
+# 10. Demonstração (dados simulados ou pasta ./data ao lado do script)
+# --------------------------------------------------------------------------- #
+def _run_demo() -> None:
     data_dir = Path(__file__).resolve().parent / "data"
     dados_reais = data_dir.is_dir() and any(data_dir.glob("*/*"))
 
@@ -589,3 +703,7 @@ if __name__ == "__main__":
         tr_df, va_df, te_df = splitter.single_split(df)
         split_dir = materialize_split(tr_df, va_df, te_df, data_dir)
         print(f"[ok] Split train/val/test materializado em: {split_dir}")
+
+
+if __name__ == "__main__":
+    main()
