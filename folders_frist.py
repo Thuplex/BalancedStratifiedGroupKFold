@@ -373,14 +373,68 @@ def print_fold_summary(
 # --------------------------------------------------------------------------- #
 # 7. Materialização em disco
 # --------------------------------------------------------------------------- #
-def _link_or_copy(src: Path, dst: Path, link: bool) -> None:
-    if dst.exists() or dst.is_symlink():
+def _copy_file(src: Path, dst: Path) -> None:
+    if dst.exists():
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if link:
-        dst.symlink_to(src.resolve())
-    else:
-        shutil.copy2(src, dst)
+    shutil.copy2(src, dst)
+
+
+def write_file_plan(
+    entries: Sequence[dict],
+    out_root: str | Path,
+    filename: str = "plano.json",
+) -> Path:
+    """
+    Grava em `out_root/filename` o plano de materialização: uma entrada por
+    imagem com, no mínimo, 'origem' (arquivo real em `data/`, sempre
+    existente) e 'destino' (onde o arquivo materializado ficaria/fica).
+
+    Os montadores do plano (`materialize_folds`/`materialize_split`/
+    `materialize_nested`) também incluem 'classe', 'sonograma_id' e a pasta
+    de destino (fold ou split) em cada entrada. Isso torna o JSON
+    AUTOSSUFICIENTE: dá para treinar lendo `origem` + esses campos direto
+    do plano, sem nenhuma pasta física existir — ver `criar_arquivos=False`
+    em `materialize_folds`/`materialize_split`.
+
+    Retorna o caminho do arquivo gravado.
+    """
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+    dest = out_root / filename
+    dest.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    return dest
+
+
+def load_file_plan(plan_path: str | Path) -> list[dict]:
+    """Lê de volta um plano gravado por `write_file_plan`."""
+    return json.loads(Path(plan_path).read_text(encoding="utf-8"))
+
+
+def apply_file_plan(plan: str | Path | Sequence[dict]) -> int:
+    """
+    Copia cada arquivo de destino a partir da sua origem, conforme um plano
+    gerado por `write_file_plan` (aceita o JSON já em memória — lista de
+    dicts com 'origem'/'destino' — ou o caminho do arquivo gravado em
+    disco, relido do zero).
+
+    Reexecuções são seguras/idempotentes (destinos já existentes são
+    pulados). Retorna a quantidade de arquivos criados nesta chamada.
+    """
+    if isinstance(plan, (str, Path)):
+        plan = load_file_plan(plan)
+
+    criados = 0
+    for entry in plan:
+        if isinstance(entry, dict):
+            src, dst = Path(entry["origem"]), Path(entry["destino"])
+        else:
+            src, dst = Path(entry[0]), Path(entry[1])
+        if dst.exists():
+            continue
+        _copy_file(src, dst)
+        criados += 1
+    return criados
 
 
 def write_fold_manifest(
@@ -392,12 +446,11 @@ def write_fold_manifest(
     filename: str = "manifest.json",
 ) -> Path:
     """
-    Grava em `out_root/filename` um relatório JSON informando em qual pasta
-    (fold) cada sonograma foi colocado:
+    Grava em `out_root/filename` um relatório JSON informando em qual fold
+    cada sonograma foi colocado:
 
         {
           "<sonograma_id>": {
-            "pasta": "fold_0",
             "fold": 0,
             "classe": "...",
             "n_imagens": 23
@@ -408,8 +461,6 @@ def write_fold_manifest(
     Retorna o caminho do arquivo gravado.
     """
     out_root = Path(out_root)
-    k = int(df[fold_col].max()) + 1
-    width = len(str(k - 1))
 
     grouped = df.groupby(group_col).agg(
         classe=(label_col, "first"),
@@ -419,7 +470,6 @@ def write_fold_manifest(
 
     manifest = {
         str(sonograma): {
-            "pasta": f"fold_{int(row.fold):0{width}d}",
             "fold": int(row.fold),
             "classe": row.classe,
             "n_imagens": int(row.n_imagens),
@@ -441,22 +491,36 @@ def materialize_folds(
     group_col: str = "sonograma_id",
     label_col: str = "classe",
     fold_col: str = "fold",
-    link: bool = True,
     flatten: bool = False,
+    criar_arquivos: bool = True,
 ) -> Path:
     """
-    Materializa a PARTIÇÃO EM FOLDS (a divisão em si, antes de qualquer
-    escolha de treino/val/teste) dentro de `data_dir/out_dirname/`:
+    Registra a PARTIÇÃO EM FOLDS (a divisão em si, antes de qualquer
+    escolha de treino/val/teste) em `data_dir/out_dirname/`:
+
+        data_dir/out_dirname/plano.json     -> 1 entrada por imagem, com
+                                                origem, classe, sonograma_id
+                                                e fold/pasta — AUTOSSUFICIENTE
+                                                para treinar sem nenhuma
+                                                pasta física (ver abaixo)
+        data_dir/out_dirname/manifest.json  -> em qual fold cada sonograma
+                                                caiu (ver `write_fold_manifest`)
+
+    Cada sonograma inteiro cai em um único fold (R1), preservando a
+    distribuição de classes (R2) e tamanho (R3) já garantidas por `fit`.
+
+    `criar_arquivos=True` (padrão) também copia cada imagem para:
 
         data_dir/out_dirname/fold_00/<classe>/<sonograma_id>/<recorte>.png
         ...
         data_dir/out_dirname/fold_09/<classe>/<sonograma_id>/<recorte>.png
 
-    Cada sonograma inteiro cai em uma única pasta de fold (R1), preservando
-    a distribuição de classes (R2) e tamanho (R3) já garantidas por `fit`.
-
-    Por padrão cria links simbólicos (link=True), evitando duplicar os
-    arquivos de imagem em disco; use link=False para copiar de fato.
+    Com `criar_arquivos=False`, NENHUMA pasta/cópia é criada — só o
+    `plano.json`/`manifest.json`. Nesse caso o consumidor (ex.: um
+    `Dataset` de treino) deve ler `origem` diretamente do `plano.json` e
+    filtrar por `fold`, sem depender de estrutura de disco nenhuma — é o
+    modo recomendado para inserir validação cruzada no processo (evita
+    reescrever pastas a cada mudança de fold/seed; ver conversa anterior).
     Reexecuções são seguras/idempotentes (entradas já existentes são
     puladas).
 
@@ -464,24 +528,39 @@ def materialize_folds(
     (fica `.../<classe>/<recorte>.png`), para compatibilidade com
     consumidores que esperam os arquivos direto na pasta da classe (ex.:
     `src/utils/io.py: gather_paths` deste projeto). Só é seguro quando os
-    nomes de arquivo já são únicos dentro da classe.
+    nomes de arquivo já são únicos dentro da classe. Só afeta os arquivos
+    materializados (`criar_arquivos=True`); o campo `destino` do plano
+    reflete o mesmo caminho, materializado ou não.
 
-    Também grava `out_dirname/manifest.json`, informando em qual pasta cada
-    sonograma foi colocado (ver `write_fold_manifest`).
-
-    Retorna o caminho da pasta raiz criada.
+    Retorna o caminho da pasta raiz (`out_root`).
     """
     data_dir = Path(data_dir)
     out_root = data_dir / out_dirname
     k = int(df[fold_col].max()) + 1
     width = len(str(k - 1))
 
+    entries = []
     for row in df.itertuples(index=False):
         src = Path(getattr(row, file_col))
-        fold = getattr(row, fold_col)
-        base = out_root / f"fold_{int(fold):0{width}d}" / getattr(row, label_col)
-        dst = base / src.name if flatten else base / getattr(row, group_col) / src.name
-        _link_or_copy(src, dst, link)
+        fold = int(getattr(row, fold_col))
+        classe = getattr(row, label_col)
+        sonograma = getattr(row, group_col)
+        pasta = f"fold_{fold:0{width}d}"
+        base = out_root / pasta / classe
+        dst = base / src.name if flatten else base / sonograma / src.name
+        entries.append(
+            {
+                "origem": str(src),
+                "destino": str(dst),
+                "classe": classe,
+                "sonograma_id": sonograma,
+                "fold": fold,
+            }
+        )
+
+    write_file_plan(entries, out_root)
+    if criar_arquivos:
+        apply_file_plan(entries)
 
     write_fold_manifest(df, out_root, group_col, label_col, fold_col)
 
@@ -497,25 +576,33 @@ def materialize_split(
     file_col: str = "arquivo",
     group_col: str = "sonograma_id",
     label_col: str = "classe",
-    link: bool = True,
     flatten: bool = False,
+    criar_arquivos: bool = True,
 ) -> Path:
     """
-    Materializa UM split 80/10/10 (train/val/test) dentro de
-    `data_dir/out_dirname/`, no formato esperado por bibliotecas do tipo
-    ImageFolder:
+    Registra UM split 80/10/10 (train/val/test) em `data_dir/out_dirname/`:
 
-        data_dir/out_dirname/train/<classe>/<sonograma_id>/<recorte>.png
-        data_dir/out_dirname/val/<classe>/<sonograma_id>/<recorte>.png
-        data_dir/out_dirname/test/<classe>/<sonograma_id>/<recorte>.png
+        data_dir/out_dirname/plano.json   -> 1 entrada por imagem, com
+                                              origem, classe, sonograma_id
+                                              e split (train/val/test) —
+                                              AUTOSSUFICIENTE para treinar
+                                              sem nenhuma pasta física
 
     Recebe os três DataFrames devolvidos por `BalancedStratifiedGroupKFold`
     (por exemplo os de `.single_split(df)`, ou qualquer rodada de
     `.split(df)` já indexada com `.iloc`). O conjunto de teste nunca se
     mistura com treino/validação (R4).
 
-    Por padrão cria links simbólicos (link=True); use link=False para
-    copiar de fato. Reexecuções são seguras/idempotentes.
+    `criar_arquivos=True` (padrão) também copia cada imagem, no formato
+    esperado por bibliotecas do tipo ImageFolder:
+
+        data_dir/out_dirname/train/<classe>/<sonograma_id>/<recorte>.png
+        data_dir/out_dirname/val/<classe>/<sonograma_id>/<recorte>.png
+        data_dir/out_dirname/test/<classe>/<sonograma_id>/<recorte>.png
+
+    Com `criar_arquivos=False`, NENHUMA pasta/cópia é criada — só o
+    `plano.json` (ver nota equivalente em `materialize_folds`).
+    Reexecuções são seguras/idempotentes.
 
     `flatten=True` remove o nível `<sonograma_id>` do caminho de destino
     (fica `.../<classe>/<recorte>.png`) — ver nota em `materialize_folds`.
@@ -523,12 +610,27 @@ def materialize_split(
     data_dir = Path(data_dir)
     out_root = data_dir / out_dirname
 
+    entries = []
     for nome, parte in (("train", tr), ("val", va), ("test", te)):
         for row in parte.itertuples(index=False):
             src = Path(getattr(row, file_col))
-            base = out_root / nome / getattr(row, label_col)
-            dst = base / src.name if flatten else base / getattr(row, group_col) / src.name
-            _link_or_copy(src, dst, link)
+            classe = getattr(row, label_col)
+            sonograma = getattr(row, group_col)
+            base = out_root / nome / classe
+            dst = base / src.name if flatten else base / sonograma / src.name
+            entries.append(
+                {
+                    "origem": str(src),
+                    "destino": str(dst),
+                    "classe": classe,
+                    "sonograma_id": sonograma,
+                    "split": nome,
+                }
+            )
+
+    write_file_plan(entries, out_root)
+    if criar_arquivos:
+        apply_file_plan(entries)
 
     return out_root
 
@@ -560,10 +662,9 @@ def write_fold_counts(
 # 9. CLI orientada a YAML (integração com resize_images.py/make_splits.py)
 # --------------------------------------------------------------------------- #
 def load_cv_split_config(path: str | Path) -> dict:
-    """Lê a seção `cv_split` de um preprocession_configs*.yaml / cv_split_*.yaml."""
+    """Lê um cv_split_*.yaml (chaves no nível raiz do arquivo)."""
     with open(path, "r") as f:
-        data = yaml.safe_load(f)
-    cv = data["cv_split"]
+        cv = yaml.safe_load(f)
     return {
         "src_root": cv["src_root"],
         "out_root": cv["out_root"],
@@ -573,19 +674,26 @@ def load_cv_split_config(path: str | Path) -> dict:
         "beta": cv.get("beta", 1.0),
         "seed": cv.get("seed", 42),
         "n_refine": cv.get("n_refine", 20_000),
-        "link": cv.get("link", True),
         "flatten_output": cv.get("flatten_output", True),
+        "criar_arquivos": cv.get("criar_arquivos", True),
     }
 
 
 def run_from_config(config_path: str | Path) -> Path:
     """
     Lê `src_root` (layout data_dir/<classe>/<sonograma_id>/<recorte>.png),
-    calcula os `k` folds group-aware e materializa em disco:
+    calcula os `k` folds group-aware e registra em disco:
 
-      out_root/fold_0 .. fold_<k-1>   -> partição bruta, uma pasta por fold
+      out_root/plano.json             -> 1 entrada por imagem (origem,
+                                          classe, sonograma_id, fold) —
+                                          basta isso para treinar, mesmo
+                                          sem nenhuma pasta física
       out_root/manifest.json          -> em qual fold cada sonograma caiu
       out_root/fold_counts.csv        -> imagens/sonogramas por classe e fold
+
+    Com `criar_arquivos: false` no YAML, NENHUMA pasta/cópia é criada — só
+    os três arquivos acima. Com `criar_arquivos: true` (padrão), também
+    materializa fold_0 .. fold_<k-1> em disco (copiando os arquivos).
 
     Consumo desses folds pela validação cruzada (rotacionando os k-1 folds
     de treino/validação em torno do `test_fold` fixo) ainda é um passo
@@ -617,10 +725,14 @@ def run_from_config(config_path: str | Path) -> Path:
 
     folds_dir = materialize_folds(
         df, data_dir, out_dirname=out_dirname,
-        link=cfg["link"], flatten=cfg["flatten_output"],
+        flatten=cfg["flatten_output"],
+        criar_arquivos=cfg["criar_arquivos"],
     )
     width = len(str(cfg["k"] - 1))
-    print(f"\n[ok] {cfg['k']} pastas (fold_{0:0{width}d}..fold_{cfg['k']-1:0{width}d}) materializadas em: {folds_dir}")
+    if cfg["criar_arquivos"]:
+        print(f"\n[ok] {cfg['k']} pastas (fold_{0:0{width}d}..fold_{cfg['k']-1:0{width}d}) materializadas em: {folds_dir}")
+    else:
+        print(f"\n[ok] Nenhuma pasta criada (criar_arquivos=false) — divisão registrada só em: {folds_dir / 'plano.json'}")
 
     counts_path = write_fold_counts(df, out_root)
     print(f"[ok] Contagens por classe/fold registradas em: {counts_path}")
@@ -632,7 +744,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        help="YAML com a seção `cv_split` (ex.: configs/cv_split_unbalanced.yaml). "
+        help="YAML de configuração do split (ex.: config_cv.yaml). "
              "Se omitido, roda a demonstração com dados simulados ou a pasta ./data ao lado do script.",
     )
     args = parser.parse_args()
