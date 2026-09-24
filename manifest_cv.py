@@ -38,13 +38,6 @@ import yaml
 
 from folders_frist import GroupTable, assign_groups_to_folds
 
-try:
-    from PIL import Image
-    from torch.utils.data import Dataset
-except ImportError:  # só necessário se for de fato instanciar ManifestGroupDataset
-    Image = None
-    Dataset = object
-
 
 # --------------------------------------------------------------------------- #
 # 1. Leitura DIRETO em nível de grupo (nunca cria 1 linha por imagem)
@@ -336,49 +329,7 @@ def write_k0k1_counts(
 
 
 # --------------------------------------------------------------------------- #
-# 4. Dataset: resolve imagens só na hora, a partir de sonograma_ids
-# --------------------------------------------------------------------------- #
-class ManifestGroupDataset(Dataset):
-    """
-    Recebe uma lista de `sonograma_id` (ex.: o `tr`/`va` de
-    `K0K1ManifestCV.split`) e resolve as imagens de cada um a partir do
-    campo `caminho` já gravado no manifest (Arquivo 1) — nenhum
-    plano.json, nenhuma pasta materializada.
-    """
-
-    def __init__(
-        self,
-        group_ids: list[str],
-        manifest: dict,
-        transform=None,
-        label_to_idx: dict | None = None,
-        extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg"),
-    ):
-        sonogramas = manifest["sonogramas"]
-        self.entries = []
-        for gid in group_ids:
-            info = sonogramas[gid]
-            pasta = Path(info["caminho"])
-            classe = info["classe"]
-            for img in sorted(pasta.iterdir()):
-                if img.suffix.lower() in extensions:
-                    self.entries.append((img, classe))
-        self.transform = transform
-        self.label_to_idx = label_to_idx
-
-    def __len__(self):
-        return len(self.entries)
-
-    def __getitem__(self, idx):
-        path, classe = self.entries[idx]
-        img = Image.open(path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return img, self.label_to_idx[classe]
-
-
-# --------------------------------------------------------------------------- #
-# 5. CLI orientada a YAML
+# 4. CLI orientada a YAML
 # --------------------------------------------------------------------------- #
 def load_manifest_cv_config(path: str | Path) -> dict:
     """Lê um config_manifest_cv.yaml (chaves no nível raiz do arquivo)."""
@@ -452,49 +403,6 @@ def main() -> None:
 
     if args.config:
         run_from_config(args.config)
-    else:
-        _run_demo()
-
-
-# --------------------------------------------------------------------------- #
-# 6. Demonstração (sem YAML)
-# --------------------------------------------------------------------------- #
-def _run_demo() -> None:
-    data_dir = Path("data/all_sonogram_folder")
-    if not data_dir.is_dir():
-        data_dir = Path("data")
-
-    K0, K1 = 10, 5
-    cv = K0K1ManifestCV(k0=K0, k1=K1)
-    manifest = cv.fit_from_folders(data_dir)
-
-    sonogramas = manifest["sonogramas"]
-    n_grupos = len(sonogramas)
-    n_imagens = sum(info["n_imagens"] for info in sonogramas.values())
-    print(f"Grupos (sonogramas): {n_grupos} | imagens: {n_imagens}")
-    print(f"K0={K0} pastas fixas | K1={K1} pastas recalculadas a cada rodada\n")
-
-    # conferência: cada sonograma deve ser teste em exatamente 1 das K0 rodadas
-    for gid, info in sonogramas.items():
-        n_teste = sum(1 for r in info["rodadas"].values() if r["is_teste"])
-        assert n_teste == 1, f"{gid} apareceu como teste em {n_teste} rodadas (esperado: 1)"
-    print(f"[ok] cada sonograma é teste em exatamente 1 das {K0} rodadas\n")
-
-    print(f"--- rodada fold_0: validação cruzada interna (k1={K1}) ---")
-    for i, (tr, va) in enumerate(cv.split(manifest, rodada=0)):
-        print(f"  fold_cv {i}: treino {len(tr):4d} sonogramas | val {len(va):4d} sonogramas")
-    print(f"  teste (fixo da rodada fold_0): {len(cv.test_groups(manifest, rodada=0))} sonogramas")
-
-    manifest_path = write_manifest(manifest, data_dir.parent / "manifest_k0k1.json")
-    print(f"\n[ok] Arquivo 1 (sonogramas x rodadas de K0) gravado em: {manifest_path}")
-
-    indice = derive_audit_index(manifest)
-    indice_path = write_manifest(indice, data_dir.parent / "manifest_k0k1_auditoria.json")
-    print(f"[ok] Arquivo 2 (auditoria, pasta -> sonogramas) gravado em: {indice_path}")
-
-    counts_path = write_k0k1_counts(manifest, data_dir.parent)
-    print(f"[ok] Contagens por classe/fold/fold_cv (com %) registradas em: {counts_path}")
-
 
 if __name__ == "__main__":
     main()
