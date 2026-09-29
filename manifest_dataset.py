@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from manifest_cv import IMG_EXTENSIONS, listar_ordenado
+
 try:
     from PIL import Image
 except ImportError:  # só necessário se for de fato instanciar ManifestGroupDataset
@@ -35,7 +37,7 @@ class ManifestGroupDataset(Dataset):
         manifest: dict,
         transform=None,
         label_to_idx: dict | None = None,
-        extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg"),
+        extensions: tuple[str, ...] = IMG_EXTENSIONS,
     ):
         sonogramas = manifest["sonogramas"]
         self.entries = []
@@ -43,9 +45,10 @@ class ManifestGroupDataset(Dataset):
             info = sonogramas[gid]
             pasta = Path(info["caminho"])
             classe = info["classe"]
-            for img in sorted(pasta.iterdir()):
-                if img.suffix.lower() in extensions:
-                    self.entries.append((img, classe))
+            # mesma listagem/ordem de manifest_cv — a sequência de imagens
+            # sai igual em qualquer máquina/SO
+            for img in listar_ordenado(pasta, extensions=extensions):
+                self.entries.append((img, classe))
         self.transform = transform
         self.label_to_idx = label_to_idx
 

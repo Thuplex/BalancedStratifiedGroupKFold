@@ -18,11 +18,12 @@ Processo (ver conversa):
 Isso garante que um sonograma nunca tenha suas imagens espalhadas entre
 pastas diferentes, nem em K0 nem em K1, em nenhum momento do processo.
 
-Reaproveita o NÚCLEO do algoritmo (GroupTable, assign_groups_to_folds) de
-folders_frist.py — não duplica a lógica de custo/atribuição, só o "entra e
-sai" ao redor dela. É a implementação atual do projeto para a validação
-cruzada aninhada; o antigo `cross_validation.py` (rodada única) foi
-removido por ficar redundante com `K0K1ManifestCV`.
+O NÚCLEO do algoritmo (GroupTable, _cost, assign_groups_to_folds) mora
+na seção 0 deste arquivo; o resto é só o "entra e sai" ao redor dele. É a
+implementação atual do projeto para a validação cruzada aninhada; os
+antigos `cross_validation.py` (rodada única) e `folders_frist.py` (split
+único, materializado em pastas) foram removidos por ficarem redundantes
+com `K0K1ManifestCV`.
 """
 
 from __future__ import annotations
@@ -30,42 +31,263 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
 import yaml
 
-from folders_frist import GroupTable, assign_groups_to_folds
+
+# --------------------------------------------------------------------------- #
+# 0. Núcleo: tabela por grupo, função de custo e atribuição grupo -> pasta
+# --------------------------------------------------------------------------- #
+@dataclass
+class GroupTable:
+    """Representação agregada dos grupos."""
+    group_ids: np.ndarray      # (G,)  identificador do sonograma
+    class_matrix: np.ndarray   # (G, C) contagem de recortes por classe
+    sizes: np.ndarray          # (G,)  total de recortes do sonograma
+    classes: np.ndarray        # (C,)  rótulos das colunas
+
+
+# --------------------------------------------------------------------------- #
+# 0b. Função de custo
+# --------------------------------------------------------------------------- #
+def _cost(
+    fold_class: np.ndarray,   # (K, C)
+    fold_size: np.ndarray,    # (K,)
+    target_class: np.ndarray, # (C,)
+    target_size: float,
+    alpha: float,
+    beta: float,
+) -> float:
+    """
+    Desvio quadrático NORMALIZADO em relação ao fold ideal.
+
+    A normalização por `target` é essencial: sem ela, uma classe majoritária
+    com 10.000 imagens domina o custo e as classes raras ficam mal
+    distribuídas. Com ela, errar 5 imagens numa classe de 50 pesa o mesmo
+    que errar 1.000 numa classe de 10.000.
+
+    alpha -> peso da estratificação (R2)
+    beta  -> peso do balanceamento de tamanho (R3)
+    """
+    return float(_fold_cost(fold_class, fold_size, target_class, target_size, alpha, beta).sum())
+
+
+def _fold_cost(
+    fold_class: np.ndarray,   # (..., C)
+    fold_size: np.ndarray,    # (...,)
+    target_class: np.ndarray, # (C,)
+    target_size: float,
+    alpha: float,
+    beta: float,
+) -> np.ndarray:
+    """
+    Parcela de `_cost` de cada pasta (somar sobre as pastas dá `_cost`).
+    Aceita lotes (...) — o refinamento usa isso pra avaliar de uma vez todos
+    os destinos/parceiros possíveis de um grupo, já que mover ou trocar
+    grupos só altera o custo das DUAS pastas envolvidas.
+    """
+    dc = (fold_class - target_class) / np.maximum(target_class, 1.0)
+    ds = (fold_size - target_size) / max(target_size, 1.0)
+    return alpha * (dc ** 2).sum(axis=-1) + beta * ds ** 2
+
+
+# --------------------------------------------------------------------------- #
+# 0c. Atribuição gulosa + refinamento local
+# --------------------------------------------------------------------------- #
+def assign_groups_to_folds(
+    gt: GroupTable,
+    k: int = 10,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+) -> np.ndarray:
+    """
+    Retorna vetor (G,) com o índice do fold [0..k-1] de cada grupo.
+
+    Etapa A (gulosa): processa os sonogramas do MAIOR para o MENOR e coloca
+    cada um no fold que minimiza o custo naquele momento. Ordenar por tamanho
+    decrescente é o que garante o balanceamento — os grupos grandes (difíceis
+    de acomodar) entram primeiro e os pequenos servem de "ajuste fino".
+    Sonogramas de mesmo tamanho mantêm a ordem de `gt` (a de leitura:
+    classe, depois id).
+
+    Etapa B (refinamento sistemático): varre, em ordem fixa, todos os
+    movimentos (1 grupo -> outra pasta) e todas as trocas (2 grupos de
+    pastas diferentes), aceitando só as que reduzem o custo, e repete as
+    varreduras até uma inteira não melhorar nada. Termina sempre (o custo
+    cai estritamente a cada alteração aceita) e o resultado é um ótimo
+    local: nenhum movimento ou troca isolada ainda reduz o custo.
+
+    Totalmente determinístico: sem sorteio em nenhuma etapa, o resultado
+    depende só de `gt`, `k`, `alpha` e `beta`.
+    """
+    g, c = gt.class_matrix.shape
+
+    if k < 2:
+        raise ValueError("k deve ser >= 2.")
+    if g < k:
+        raise ValueError(f"Apenas {g} sonogramas para {k} folds.")
+
+    target_class = gt.class_matrix.sum(axis=0) / k
+    target_size = float(gt.sizes.sum()) / k
+
+    # aviso de classe rara
+    groups_per_class = (gt.class_matrix > 0).sum(axis=0)
+    for cls, n in zip(gt.classes, groups_per_class):
+        if n < k:
+            print(
+                f"[aviso] classe '{cls}' aparece em apenas {n} sonogramas "
+                f"(< k={k}): haverá folds sem essa classe."
+            )
+
+    # ---- Etapa A: guloso ----
+    order = np.argsort(-gt.sizes, kind="stable")  # tamanho desc, empate pela ordem de leitura (classe, id)
+    fold_class = np.zeros((k, c), dtype=np.float64)
+    fold_size = np.zeros(k, dtype=np.float64)
+    assign = np.full(g, -1, dtype=np.int64)
+
+    for gi in order:
+        best_f, best_j = -1, np.inf
+        for f in range(k):
+            fold_class[f] += gt.class_matrix[gi]
+            fold_size[f] += gt.sizes[gi]
+            j = _cost(fold_class, fold_size, target_class, target_size, alpha, beta)
+            fold_class[f] -= gt.class_matrix[gi]
+            fold_size[f] -= gt.sizes[gi]
+            if j < best_j:
+                best_f, best_j = f, j
+        assign[gi] = best_f
+        fold_class[best_f] += gt.class_matrix[gi]
+        fold_size[best_f] += gt.sizes[gi]
+
+    # ---- Etapa B: refinamento sistemático ----
+    X, S = gt.class_matrix, gt.sizes
+    targets = (target_class, target_size, alpha, beta)
+
+    def apply_move(gi: int, src: int, dst: int) -> None:
+        fold_class[src] -= X[gi]
+        fold_size[src] -= S[gi]
+        fold_class[dst] += X[gi]
+        fold_size[dst] += S[gi]
+        assign[gi] = dst
+
+    melhorou = True
+    while melhorou:
+        melhorou = False
+
+        # movimento: cada grupo, em ordem, vai pra pasta que mais reduz o
+        # custo (empate -> menor índice de pasta, via argmin)
+        for gi in range(g):
+            src = int(assign[gi])
+            atual = _fold_cost(fold_class, fold_size, *targets)                       # (K,)
+            src_sem_gi = _fold_cost(fold_class[src] - X[gi], fold_size[src] - S[gi], *targets)
+            dst_com_gi = _fold_cost(fold_class + X[gi], fold_size + S[gi], *targets)  # (K,)
+            delta = (src_sem_gi - atual[src]) + (dst_com_gi - atual)
+            delta[src] = np.inf
+            dst = int(np.argmin(delta))
+            if delta[dst] < -1e-12:
+                apply_move(gi, src, dst)
+                melhorou = True
+
+        # troca: cada grupo `a`, em ordem, troca com o parceiro `b` (de outra
+        # pasta) que mais reduz o custo (empate -> menor índice de grupo)
+        for a in range(g):
+            fa = int(assign[a])
+            fb = assign                                                               # (G,)
+            atual = _fold_cost(fold_class, fold_size, *targets)                       # (K,)
+            d_class, d_size = X - X[a], S - S[a]   # o que a pasta de `a` ganha na troca
+            fa_novo = _fold_cost(fold_class[fa] + d_class, fold_size[fa] + d_size, *targets)
+            fb_novo = _fold_cost(fold_class[fb] - d_class, fold_size[fb] - d_size, *targets)
+            delta = (fa_novo - atual[fa]) + (fb_novo - atual[fb])                     # (G,)
+            delta[fb == fa] = np.inf
+            b = int(np.argmin(delta))
+            if delta[b] < -1e-12:
+                fb_b = int(assign[b])
+                apply_move(a, fa, fb_b)
+                apply_move(b, fb_b, fa)
+                melhorou = True
+
+    return assign
 
 
 # --------------------------------------------------------------------------- #
 # 1. Leitura DIRETO em nível de grupo (nunca cria 1 linha por imagem)
 # --------------------------------------------------------------------------- #
+IMG_EXTENSIONS: tuple[str, ...] = (".png", ".jpg", ".jpeg")
+
+
+def nome_portavel(p: Path) -> str:
+    """
+    Nome de `p` em Unicode NFC. macOS pode gravar nomes acentuados em NFD e
+    Linux/Windows em NFC — mesmo texto visual, strings diferentes; normalizar
+    faz o mesmo nome virar a mesma string (e a mesma ordem) em qualquer SO.
+    """
+    return unicodedata.normalize("NFC", p.name)
+
+
+def listar_ordenado(
+    pasta: str | Path,
+    pastas: bool = False,
+    extensions: tuple[str, ...] = IMG_EXTENSIONS,
+) -> list[Path]:
+    """
+    Subpastas (`pastas=True`) ou imagens de `pasta`, em ordem IDÊNTICA em
+    qualquer máquina/SO:
+      - ordena pelo nome NFC como string (ordem de code point), e não por
+        `Path` — `WindowsPath` compara sem diferenciar maiúsculas, `PosixPath`
+        diferencia, então `sorted(Path)` muda de ordem entre SOs;
+      - ignora nomes ocultos (`.ipynb_checkpoints`, `.DS_Store`, `._x.png` do
+        macOS...), que existem numa máquina e não na outra.
+    """
+    itens = [p for p in Path(pasta).iterdir() if not p.name.startswith(".")]
+    if pastas:
+        itens = [p for p in itens if p.is_dir()]
+    else:
+        itens = [p for p in itens if p.is_file() and p.suffix.lower() in extensions]
+    return sorted(itens, key=nome_portavel)
+
+
 def build_group_table_from_folders(
     data_dir: str | Path,
-    extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg"),
+    extensions: tuple[str, ...] = IMG_EXTENSIONS,
 ) -> GroupTable:
     """
     Varre `data_dir/<classe>/<sonograma_id>/*.png` e monta a GroupTable
-    direto — sem nunca criar uma linha por imagem (folders_frist.py monta
-    um df de N imagens e só depois agrega; aqui já nasce agregado).
+    direto — sem nunca criar uma linha por imagem (já nasce agregado).
 
     Assume 1 classe por sonograma (verdade neste dataset: a classe é a
     pasta-mãe do sonograma), então a contagem por classe do grupo é só
     [0, ..., n, ..., 0], com n = nº de imagens da pasta.
+
+    A ordem dos grupos (que decide os empates de `assign_groups_to_folds`)
+    vem de `listar_ordenado`, então é a mesma em qualquer máquina/SO.
     """
     data_dir = Path(data_dir)
     group_ids, classe_por_grupo, sizes = [], [], []
 
-    for classe_dir in sorted(p for p in data_dir.iterdir() if p.is_dir()):
-        for sonograma_dir in sorted(p for p in classe_dir.iterdir() if p.is_dir()):
-            n = sum(1 for f in sonograma_dir.iterdir() if f.suffix.lower() in extensions)
+    for classe_dir in listar_ordenado(data_dir, pastas=True):
+        for sonograma_dir in listar_ordenado(classe_dir, pastas=True):
+            n = len(listar_ordenado(sonograma_dir, extensions=extensions))
             if n == 0:
                 continue
-            group_ids.append(sonograma_dir.name)
-            classe_por_grupo.append(classe_dir.name)
+            group_ids.append(nome_portavel(sonograma_dir))
+            classe_por_grupo.append(nome_portavel(classe_dir))
             sizes.append(n)
+
+    # o manifest é indexado por sonograma_id: um id repetido (em 2 classes,
+    # ou 2 nomes que só diferem em maiúscula/acentuação) seria sobrescrito
+    # em silêncio
+    vistos: dict[str, str] = {}
+    for gid, classe in zip(group_ids, classe_por_grupo):
+        if gid in vistos:
+            raise ValueError(
+                f"sonograma_id '{gid}' repetido em '{vistos[gid]}' e '{classe}'."
+            )
+        vistos[gid] = classe
 
     classes = np.array(sorted(set(classe_por_grupo)))
     idx_classe = {c: i for i, c in enumerate(classes)}
@@ -105,9 +327,9 @@ def load_manifest(path: str | Path) -> dict:
 class K0K1ManifestCV:
     """
     Uso:
-        cv = K0K1ManifestCV(k0=10, k1=5, seed=42)
+        cv = K0K1ManifestCV(k0=10, k1=5)
         manifest = cv.fit_from_folders("data/all_sonogram_folder")
-        # manifest["config"]        -> k0, k1, alpha, beta, seed, ...
+        # manifest["config"]        -> k0, k1, alpha, beta, src_root
         # manifest["sonogramas"][sonograma_id] -> {caminho, classe, n_imagens,
         #                                          rodadas: {"fold_0": {...}, ...}}
 
@@ -123,15 +345,11 @@ class K0K1ManifestCV:
         k1: int = 5,
         alpha: float = 1.0,
         beta: float = 1.0,
-        seed: int = 42,
-        n_refine: int = 20_000,
     ):
         self.k0 = k0
         self.k1 = k1
         self.alpha = alpha
         self.beta = beta
-        self.seed = seed
-        self.n_refine = n_refine
 
     def _rodada_key(self, round_idx: int) -> str:
         width = len(str(self.k0 - 1))
@@ -146,14 +364,16 @@ class K0K1ManifestCV:
 
         # K0: calculado 1x só, fixo pras k0 rodadas
         outer_assign = assign_groups_to_folds(
-            gt, self.k0, self.alpha, self.beta, self.seed, self.n_refine
+            gt, self.k0, self.alpha, self.beta
         )
 
         sonogramas: dict[str, dict] = {}
         for i, group_id in enumerate(gt.group_ids):
             classe = _classe_do_grupo(gt, i)
             sonogramas[str(group_id)] = {
-                "caminho": str(src_root / classe / str(group_id)),
+                # sempre com "/" (as_posix) — o manifest sai idêntico em
+                # Windows e Linux, e Path("a/b") funciona nos dois
+                "caminho": (src_root / classe / str(group_id)).as_posix(),
                 "classe": classe,
                 "n_imagens": int(gt.sizes[i]),
                 "rodadas": {},
@@ -170,7 +390,7 @@ class K0K1ManifestCV:
                 classes=gt.classes,
             )
             inner_assign = assign_groups_to_folds(
-                gt_restante, self.k1, self.alpha, self.beta, self.seed, self.n_refine
+                gt_restante, self.k1, self.alpha, self.beta
             )
             fold_cv_por_grupo = dict(zip(gt_restante.group_ids, inner_assign))
 
@@ -189,9 +409,7 @@ class K0K1ManifestCV:
                 "k1": self.k1,
                 "alpha": self.alpha,
                 "beta": self.beta,
-                "seed": self.seed,
-                "n_refine": self.n_refine,
-                "src_root": str(src_root),
+                "src_root": src_root.as_posix(),
             },
             "sonogramas": sonogramas,
         }
@@ -257,8 +475,8 @@ def derive_audit_index(manifest: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 3c. Registro de contagens por classe/fold (auditoria) — equivalente ao
-#     fold_counts.csv de folders_frist.py, com as duas colunas de fold
+# 3c. Registro de contagens por classe/fold (auditoria) — fold_counts.csv
+#     com as duas colunas de fold (rodada de K0 e pasta de K1)
 # --------------------------------------------------------------------------- #
 def write_k0k1_counts(
     manifest: dict,
@@ -342,8 +560,6 @@ def load_manifest_cv_config(path: str | Path) -> dict:
         "k1": cfg.get("k1", 5),
         "alpha": cfg.get("alpha", 1.0),
         "beta": cfg.get("beta", 1.0),
-        "seed": cfg.get("seed", 42),
-        "n_refine": cfg.get("n_refine", 20_000),
     }
 
 
@@ -365,8 +581,6 @@ def run_from_config(config_path: str | Path) -> Path:
         k1=cfg["k1"],
         alpha=cfg["alpha"],
         beta=cfg["beta"],
-        seed=cfg["seed"],
-        n_refine=cfg["n_refine"],
     )
     manifest = cv.fit_from_folders(cfg["src_root"])
 
