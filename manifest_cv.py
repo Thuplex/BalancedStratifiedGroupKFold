@@ -1,30 +1,3 @@
-"""
-Divisão aninhada K0 x K1 centrada em GRUPO (sonograma), sem nunca passar
-por um DataFrame com 1 linha por imagem.
-
-Processo (ver conversa):
-  1. K0 é calculado UMA VEZ (fixo para todas as rodadas): divide todos os
-     sonogramas em K0 pastas.
-  2. Para CADA uma das K0 rodadas (uma por pasta de K0):
-       - a pasta da rodada vira o teste fixo daquela rodada;
-       - as K0-1 pastas restantes são reagrupadas num único pool;
-       - esse pool é reparticionado DO ZERO em K1 pastas novas (a partição
-         K1 é recalculada a cada rodada, porque o pool muda a cada vez).
-  3. Dentro de uma rodada, a validação cruzada com K1 pastas reaproveita a
-     MESMA atribuição de fold_cv nas suas K1 combinações de treino/val —
-     nunca recalcula o agrupamento, só re-rotula qual pasta é "validação"
-     naquela combinação.
-
-Isso garante que um sonograma nunca tenha suas imagens espalhadas entre
-pastas diferentes, nem em K0 nem em K1, em nenhum momento do processo.
-
-O NÚCLEO do algoritmo (GroupTable, _cost, assign_groups_to_folds) mora
-na seção 0 deste arquivo; o resto é só o "entra e sai" ao redor dele. É a
-implementação atual do projeto para a validação cruzada aninhada; os
-antigos `cross_validation.py` (rodada única) e `folders_frist.py` (split
-único, materializado em pastas) foram removidos por ficarem redundantes
-com `K0K1ManifestCV`.
-"""
 
 from __future__ import annotations
 
@@ -35,7 +8,6 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
-
 import numpy as np
 import yaml
 
@@ -125,15 +97,15 @@ def assign_groups_to_folds(
     Totalmente determinístico: sem sorteio em nenhuma etapa, o resultado
     depende só de `gt`, `k`, `alpha` e `beta`.
     """
-    g, c = gt.class_matrix.shape
+    g, c = gt.class_matrix.shape #recebe as linhas e colunas, classes e total de itens
 
     if k < 2:
         raise ValueError("k deve ser >= 2.")
     if g < k:
         raise ValueError(f"Apenas {g} sonogramas para {k} folds.")
 
-    target_class = gt.class_matrix.sum(axis=0) / k
-    target_size = float(gt.sizes.sum()) / k
+    target_class = gt.class_matrix.sum(axis=0) / k #total por classe
+    target_size = float(gt.sizes.sum()) / k #total por pasta
 
     # aviso de classe rara
     groups_per_class = (gt.class_matrix > 0).sum(axis=0)
@@ -145,7 +117,7 @@ def assign_groups_to_folds(
             )
 
     # ---- Etapa A: guloso ----
-    order = np.argsort(-gt.sizes, kind="stable")  # tamanho desc, empate pela ordem de leitura (classe, id)
+    order = np.argsort(-gt.sizes, kind="stable")  # ordenação decrescente, empate pela ordem de leitura (classe, id)
     fold_class = np.zeros((k, c), dtype=np.float64)
     fold_size = np.zeros(k, dtype=np.float64)
     assign = np.full(g, -1, dtype=np.int64)
